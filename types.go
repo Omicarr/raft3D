@@ -42,18 +42,20 @@ type PrintJob struct {
 type CommandType string
 
 const (
-	CmdCreatePrinter      CommandType = "CreatePrinter"
-	CmdCreateFilament     CommandType = "CreateFilament"
-	CmdCreatePrintJob     CommandType = "CreatePrintJob"
+	CmdCreatePrinter        CommandType = "CreatePrinter"
+	CmdCreateFilament       CommandType = "CreateFilament"
+	CmdCreatePrintJob       CommandType = "CreatePrintJob"
 	CmdUpdatePrintJobStatus CommandType = "UpdatePrintJobStatus"
 )
 
+// Command is the generic structure sent over the wire/log
 type Command struct {
 	Type    CommandType     `json:"type"`
-	Payload json.RawMessage `json:"payload"` // Store specific command data here
+	Payload json.RawMessage `json:"payload"` // Store specific command data here as raw JSON bytes
 }
 
 // --- Command Payloads ---
+// Specific data structures for each command type
 
 type CreatePrinterPayload struct {
 	Printer Printer `json:"printer"`
@@ -72,7 +74,7 @@ type UpdatePrintJobStatusPayload struct {
 	Status PrintJobStatus `json:"status"`
 }
 
-// Helper to serialize commands
+// Helper to serialize commands into the generic Command structure for Raft
 func serializeCommand(cmdType CommandType, payload interface{}) ([]byte, error) {
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
@@ -80,7 +82,8 @@ func serializeCommand(cmdType CommandType, payload interface{}) ([]byte, error) 
 	}
 	cmd := Command{
 		Type:    cmdType,
-		Payload: payloadBytes,
+		Payload: payloadBytes, // Assign the marshaled specific payload here
 	}
+	// Marshal the generic command structure
 	return json.Marshal(cmd)
 }

@@ -1,13 +1,14 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
-	"net/http"
 
 	"github.com/hashicorp/raft"
 )
@@ -15,7 +16,9 @@ import (
 func main() {
 	// Configure logging
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Println("[INFO] Starting Raft3D Node...")
+	log.Println("[INFO] ===================================")
+	log.Println("[INFO]    Starting Raft3D Node")
+	log.Println("[INFO] ===================================")
 
 	// Load configuration
 	cfg, err := LoadConfig()
@@ -34,63 +37,103 @@ func main() {
 	}
 	log.Println("[INFO] Raft node setup complete.")
 
-	// Start the HTTP server
+	// Create the HTTP server
 	httpServer := NewHttpServer(raftNode, fsm, cfg.HTTPAddr)
+
+	// Start the HTTP server in a separate goroutine
+	httpServerErrChan := make(chan error, 1)
 	go func() {
-		log.Printf("[INFO] Attempting to start HTTP server on %s...", cfg.HTTPAddr)
-		if err := httpServer.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("[FATAL] HTTP server failed: %v", err)
+		log.Printf("[INFO] Attempting to start HTTP server goroutine (listening on %s)...", cfg.HTTPAddr)
+		// Start blocks unless an error occurs or Shutdown is called
+		err := httpServer.Start()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("[ERROR] HTTP server failed: %v", err)
+			httpServerErrChan <- err // Send error back to main goroutine
+		} else {
+			log.Println("[INFO] HTTP server goroutine finished.")
+			httpServerErrChan <- nil // Signal clean exit
 		}
-		log.Println("[INFO] HTTP server shut down.")
+		close(httpServerErrChan)
 	}()
 
-	// Wait for leader election (optional, but helpful for demos)
-	log.Println("[INFO] Waiting for node to potentially become leader...")
-	waitForLeader(raftNode, 15*time.Second) // Wait up to 15 seconds
+	// Optional: Wait briefly for cluster stabilization (leader election/discovery)
+	log.Println("[INFO] Waiting briefly for cluster stabilization...")
+	waitForLeaderOrPeer(raftNode, 15*time.Second) // Wait up to 15 seconds
 
-	// Wait for termination signal
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
-	sig := <-quit
-	log.Printf("[INFO] Received signal %s. Shutting down node %s...", sig, cfg.NodeID)
+	// Wait for termination signal (Ctrl+C or SIGTERM) or HTTP server error
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
 
-	// Attempt graceful shutdown
-	shutdownFuture := raftNode.Shutdown()
-	if err := shutdownFuture.Error(); err != nil {
-		log.Printf("[WARN] Error during Raft shutdown for node %s: %v", cfg.NodeID, err)
-	} else {
-		log.Printf("[INFO] Raft node %s shut down gracefully.", cfg.NodeID)
+	select {
+	case sig := <-signalChan:
+		log.Printf("[INFO] Received OS signal %s. Initiating graceful shutdown...", sig)
+	case err := <-httpServerErrChan:
+		if err != nil {
+			log.Printf("[ERROR] HTTP server exited unexpectedly: %v. Initiating shutdown...", err)
+		} else {
+			log.Printf("[INFO] HTTP server shut down cleanly before signal received. Initiating shutdown...")
+		}
 	}
 
-	// Ideally, you would also gracefully shut down the HTTP server here
-	// (e.g., using server.Shutdown(context.Background()))
+	// --- Graceful Shutdown Sequence ---
+	log.Println("[INFO] Starting graceful shutdown...")
 
-	log.Printf("[INFO] Node %s exiting.", cfg.NodeID)
+	// 1. Shutdown HTTP Server first to stop accepting new requests
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second) // Timeout for shutdown
+	defer cancel()
+
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[WARN] Error during HTTP server graceful shutdown: %v", err)
+	} else {
+		log.Printf("[INFO] HTTP server shut down gracefully.")
+	}
+
+	// 2. Shutdown Raft Node
+	log.Printf("[INFO] Shutting down Raft node...")
+	shutdownFuture := raftNode.Shutdown() // Initiate Raft shutdown
+	if err := shutdownFuture.Error(); err != nil {
+		log.Printf("[WARN] Error during Raft node graceful shutdown: %v", err)
+	} else {
+		log.Printf("[INFO] Raft node shut down gracefully.")
+	}
+
+	// Note: BoltDB stores are closed implicitly by raftNode.Shutdown() successful completion.
+
+	log.Println("[INFO] ===================================")
+	log.Printf("[INFO]    Node %s Exiting.", cfg.NodeID)
+	log.Println("[INFO] ===================================")
 }
 
-// waitForLeader waits until the node becomes leader or timeout occurs
-func waitForLeader(r *raft.Raft, timeout time.Duration) {
-	ticker := time.NewTicker(1 * time.Second)
+// waitForLeaderOrPeer waits until the node becomes leader, discovers a leader,
+// or the timeout occurs. It's mainly for observing startup behavior.
+func waitForLeaderOrPeer(r *raft.Raft, timeout time.Duration) {
+	ticker := time.NewTicker(2 * time.Second) // Check every 2 seconds
 	defer ticker.Stop()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
+	log.Printf("[INFO] Monitoring Raft state for up to %s...", timeout)
 	for {
 		select {
 		case <-ticker.C:
-			if r.State() == raft.Leader {
-				log.Printf("[INFO] Node %s became leader.", r.String())
-				return
+			state := r.State()
+			leader := r.Leader()
+			stats := r.Stats() // Get stats for term etc.
+
+			if state == raft.Leader {
+				log.Printf("[INFO] Became leader (Term: %v). Stabilization likely complete.", stats["term"])
+				return // Exit loop once leader
 			}
-            leaderAddr := r.Leader()
-            if leaderAddr != "" {
-                log.Printf("[INFO] Node %s is %s. Current leader Raft address: %s", r.String(), r.State(), leaderAddr)
-            } else {
-                 log.Printf("[INFO] Node %s is %s. Leader unknown.", r.String(), r.State())
-            }
+			if leader != "" {
+				log.Printf("[INFO] Current state: %s, Leader: %s (Term: %v)", state, leader, stats["term"])
+				// Could return here if just knowing *a* leader is enough
+			} else {
+				log.Printf("[INFO] Current state: %s, Leader unknown (Term: %v). Still searching...", state, stats["term"])
+			}
 		case <-timer.C:
-			log.Printf("[WARN] Timed out waiting for leadership after %s. Current state: %s", timeout, r.State())
-			return
+			stats := r.Stats()
+			log.Printf("[WARN] Timed out waiting for definite leader after %s. Current state: %s, Leader: %s, Term: %v", timeout, r.State(), r.Leader(), stats["term"])
+			return // Exit loop after timeout
 		}
 	}
 }
